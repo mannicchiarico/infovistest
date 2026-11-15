@@ -1,0 +1,6 @@
+# Instalar con:  pip install -r requirements.txt
+# OJO: usar opencv-contrib-python (trae cv2.aruco). Si tienen instalado "opencv-python", desinstálenlo antes:
+#      pip uninstall opencv-python
+opencv-contrib-python>=4.7
+pyserial>=3.5
+numpy

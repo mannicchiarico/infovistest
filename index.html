@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<!--
+  VERSIÓN A: página web + Bluetooth (BLE). Pensada para Chrome en Android.
+
+  CÓMO USARLA
+  - Pongan este index.html y ajies.json en la MISMA carpeta (la tabla de ajíes se edita en ajies.json).
+  - La cámara solo funciona con HTTPS o en localhost. Con doble clic (file://) NO funciona.
+      · En el computador: en esta carpeta corran  python -m http.server 8000  y abran http://localhost:8000
+      · En el teléfono: súbanla a un hosting con HTTPS (GitHub Pages, Netlify, etc.) y ábranla en Chrome.
+  - "Conectar Arduino" busca una placa que anuncie el servicio BLE de SERVICE_UUID (abajo, en la configuración).
+  - Marquen "Modo sin Arduino" para probar solo la detección: se ve en pantalla lo que se habría enviado.
+
+  ERRORES COMUNES
+  - "No se pudo abrir la cámara": den permiso de cámara (candado junto a la dirección > Permisos) y
+    revisen que la página esté en https:// o localhost.
+  - El botón de Bluetooth está desactivado: Web Bluetooth no existe en iPhone/iPad (ningún navegador),
+    Safari ni Firefox. Usen Chrome en Android (o Chrome/Edge en el computador). También hay que activar Bluetooth
+    y, en Android, la ubicación.
+  - "No aparece el Arduino en la lista": revisen que el sketch esté corriendo y que los UUID coincidan.
+  - "Tabla no cargada": ajies.json no está junto a index.html o tiene un error de formato (falta una coma, etc.).
+-->
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Detector de ajíes</title>
+
+  <!-- Librería js-aruco2 (detecta marcadores ArUco). El orden importa: cv.js, aruco.js y luego el diccionario.
+       Su diccionario ARUCO_4X4_1000 viene de OpenCV, y los IDs 0-49 son idénticos a DICT_4X4_50
+       (OpenCV usa la misma lista para 4x4_50/100/250/1000). Por eso sirven los marcadores de chev.me en "4x4". -->
+  <script src="https://cdn.jsdelivr.net/npm/js-aruco2@2.0.0/src/cv.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/js-aruco2@2.0.0/src/aruco.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/js-aruco2@2.0.0/src/dictionaries/aruco_4x4_1000.js"></script>
+
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, sans-serif;
+      background: #1a1a1a;
+      color: #f2f2f2;
+    }
+    main { max-width: 720px; margin: 0 auto; padding: 12px; }
+    h1 { font-size: 1.2rem; margin: 4px 0 10px; }
+
+    /* El video se dibuja en este canvas (con el contorno del marcador encima) */
+    canvas { width: 100%; border-radius: 8px; background: #000; display: block; }
+    video { display: none; }
+
+    .panel {
+      margin-top: 10px;
+      padding: 12px;
+      border-radius: 8px;
+      background: #2a2a2a;
+    }
+    .nombre { font-size: 1.6rem; font-weight: bold; }
+    .dato { color: #bbb; margin-top: 4px; }
+    .estado { color: #999; font-size: 0.9rem; margin-top: 6px; }
+
+    /* Barra de nivel 0-10: el ancho y el color se cambian desde JavaScript */
+    .barra-fondo { height: 22px; border-radius: 11px; background: #444; margin-top: 10px; overflow: hidden; }
+    .barra { height: 100%; width: 0%; background: hsl(120, 80%, 45%); transition: width 0.3s, background 0.3s; }
+
+    .controles { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 10px; }
+    button {
+      font-size: 1rem;
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      background: #d9480f;
+      color: white;
+    }
+    button:disabled { background: #555; color: #999; }
+    button.conectado { background: #2b8a3e; }
+    label { display: flex; align-items: center; gap: 6px; }
+
+    #registro {
+      margin-top: 10px;
+      padding: 8px;
+      height: 140px;
+      overflow-y: auto;
+      border-radius: 8px;
+      background: #111;
+      font-family: monospace;
+      font-size: 0.85rem;
+      white-space: pre-wrap;
+    }
+    .aviso { color: #ffa94d; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>🌶️ Detector de ajíes (ArUco 4x4_50)</h1>
+
+  <video id="video" playsinline muted></video>
+  <canvas id="lienzo"></canvas>
+
+  <section class="panel">
+    <div class="nombre" id="txtNombre">Ninguna tarjeta</div>
+    <div class="dato" id="txtDetalle">Muestra una tarjeta a la cámara</div>
+    <div class="barra-fondo"><div class="barra" id="barra"></div></div>
+    <div class="estado" id="txtEstado">Cargando…</div>
+  </section>
+
+  <div class="controles">
+    <button id="btnConectar" type="button">Conectar Arduino</button>
+    <label><input type="checkbox" id="chkSinArduino" /> Modo sin Arduino</label>
+  </div>
+
+  <div id="registro"></div>
+</main>
+
+<script>
+// =====================================================================
+// CONFIGURACIÓN (cambien aquí si hace falta)
+// =====================================================================
+
+// UUID del servicio BLE y de la característica donde se ESCRIBE el mensaje.
+// Por defecto: Nordic UART Service (NUS), igual que en los sketches de referencia.
+// (Si usaran un módulo HM-10: SERVICE_UUID = 0xffe0 y RX_CHAR_UUID = 0xffe1, como números.)
+const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+
+// Si el Arduino no aparece en la lista, pongan true para mostrar TODOS los dispositivos Bluetooth.
+const MOSTRAR_TODOS_LOS_DISPOSITIVOS = false;
+
+const CUADROS_PARA_ACEPTAR = 4;   // cuadros seguidos con el mismo ID antes de aceptarlo (3-5)
+const MS_SIN_TARJETA = 1500;      // milisegundos sin marcador antes de enviar "N:0"
+const ANCHO_PROCESO = 640;        // ancho (px) al que se reduce la imagen para detectar (más chico = más rápido)
+
+// =====================================================================
+// VARIABLES DEL PROGRAMA
+// =====================================================================
+
+let tablaAjies = {};   // { id: { nombre, shu } }, se llena desde ajies.json
+let shuMax = 1;        // SHU que corresponde al nivel 10
+
+// Estado de la detección
+let candidatoId = null;       // ID que se está viendo ahora
+let cuadrosSeguidos = 0;      // cuántos cuadros seguidos lleva ese ID
+let idAceptado = null;        // ID ya confirmado (el que se muestra)
+let ultimaDeteccion = performance.now();
+let nivelEnviado = null;      // último nivel enviado (para enviar solo cuando cambia)
+
+// Estado del Bluetooth
+let dispositivoBLE = null;
+let caracteristicaBLE = null;
+let colaEscritura = Promise.resolve();  // para no escribir dos mensajes al mismo tiempo
+
+// Elementos de la página
+const video = document.getElementById("video");
+const lienzo = document.getElementById("lienzo");
+const ctx = lienzo.getContext("2d", { willReadFrequently: true });
+const btnConectar = document.getElementById("btnConectar");
+const chkSinArduino = document.getElementById("chkSinArduino");
+
+// Detector ArUco (maxHammingDistance: 1 = solo acepta coincidencias exactas, menos falsos positivos)
+const detector = new AR.Detector({ dictionaryName: "ARUCO_4X4_1000", maxHammingDistance: 1 });
+
+// =====================================================================
+// 1. CARGAR LA TABLA DE AJÍES (ajies.json)
+// =====================================================================
+
+async function cargarTabla() {
+  const respuesta = await fetch("ajies.json", { cache: "no-store" });
+  const datos = await respuesta.json();
+
+  tablaAjies = {};
+  let mayorShu = 0;
+  for (const aji of datos.ajies) {
+    tablaAjies[aji.id] = { nombre: aji.nombre, shu: aji.shu };
+    mayorShu = Math.max(mayorShu, aji.shu);
+  }
+  // Si ajies.json trae "shu_max" se usa ese; si no, el SHU más alto de la tabla
+  shuMax = datos.shu_max || mayorShu || 1;
+  registrar(`Tabla cargada: ${datos.ajies.length} ajíes, SHU máximo = ${shuMax.toLocaleString("es-CL")}`);
+}
+
+// =====================================================================
+// 2. NIVEL DE PICOR (escala logarítmica, 0 a 10)
+// =====================================================================
+
+function calcularNivel(shu) {
+  const nivel = Math.round(10 * Math.log10(shu + 1) / Math.log10(shuMax + 1));
+  return Math.max(0, Math.min(10, nivel));  // por si algún SHU supera shu_max
+}
+
+// =====================================================================
+// 3. CÁMARA
+// =====================================================================
+
+async function iniciarCamara() {
+  if (!navigator.mediaDevices || !window.isSecureContext) {
+    throw new Error("La cámara necesita HTTPS o localhost (la página no está en un contexto seguro).");
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+
+  // Tamaño del canvas: ANCHO_PROCESO de ancho, manteniendo la proporción del video
+  const escala = Math.min(1, ANCHO_PROCESO / video.videoWidth);
+  lienzo.width = Math.round(video.videoWidth * escala);
+  lienzo.height = Math.round(video.videoHeight * escala);
+}
+
+// Bucle principal: se ejecuta en cada cuadro del video
+function procesarCuadro() {
+  // a) Dibujar el cuadro actual y leer sus píxeles
+  ctx.drawImage(video, 0, 0, lienzo.width, lienzo.height);
+  const imagen = ctx.getImageData(0, 0, lienzo.width, lienzo.height);
+
+  // b) Detectar marcadores
+  const marcadores = detector.detect(imagen);
+
+  // c) Dibujar contornos; los IDs que no están en la tabla salen en gris y se ignoran
+  for (const m of marcadores) {
+    dibujarMarcador(m, tablaAjies[m.id] ? "#40c057" : "#888");
+  }
+  const validos = marcadores.filter(m => tablaAjies[m.id]);
+
+  // d) Lógica de estabilidad
+  const ahora = performance.now();
+  if (validos.length > 0) {
+    // Si hay varias tarjetas, usamos la más grande (la más cercana a la cámara)
+    validos.sort((a, b) => area(b.corners) - area(a.corners));
+    const id = validos[0].id;
+    ultimaDeteccion = ahora;
+
+    if (id === candidatoId) {
+      cuadrosSeguidos++;
+    } else {
+      candidatoId = id;
+      cuadrosSeguidos = 1;
+    }
+
+    // Se acepta el ID cuando lleva suficientes cuadros seguidos
+    if (cuadrosSeguidos >= CUADROS_PARA_ACEPTAR && id !== idAceptado) {
+      idAceptado = id;
+      const aji = tablaAjies[id];
+      const nivel = calcularNivel(aji.shu);
+      mostrarAji(id, aji, nivel);
+      enviarNivel(nivel);
+    }
+    if (id !== idAceptado) {
+      ponerEstado(`Detectando ID ${id}… (${cuadrosSeguidos}/${CUADROS_PARA_ACEPTAR})`);
+    }
+  } else {
+    // Ningún marcador en este cuadro
+    candidatoId = null;
+    cuadrosSeguidos = 0;
+    if (ahora - ultimaDeteccion > MS_SIN_TARJETA && nivelEnviado !== 0) {
+      idAceptado = null;
+      mostrarNada();
+      enviarNivel(0);
+    }
+  }
+
+  requestAnimationFrame(procesarCuadro);
+}
+
+// Dibuja el contorno de un marcador y su ID
+function dibujarMarcador(marcador, color) {
+  const c = marcador.corners;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(c[0].x, c[0].y);
+  for (let i = 1; i < 4; i++) ctx.lineTo(c[i].x, c[i].y);
+  ctx.closePath();
+  ctx.stroke();
+
+  ctx.fillStyle = color;
+  ctx.font = "bold 22px sans-serif";
+  ctx.fillText("ID " + marcador.id, c[0].x, c[0].y - 8);
+}
+
+// Área aproximada de un marcador (fórmula del polígono)
+function area(c) {
+  let suma = 0;
+  for (let i = 0; i < 4; i++) {
+    const j = (i + 1) % 4;
+    suma += c[i].x * c[j].y - c[j].x * c[i].y;
+  }
+  return Math.abs(suma) / 2;
+}
+
+// =====================================================================
+// 4. MOSTRAR EN PANTALLA
+// =====================================================================
+
+function mostrarAji(id, aji, nivel) {
+  document.getElementById("txtNombre").textContent = aji.nombre;
+  document.getElementById("txtDetalle").textContent =
+    `ID ${id} · ${aji.shu.toLocaleString("es-CL")} SHU · Nivel ${nivel}/10`;
+  pintarBarra(nivel);
+  ponerEstado(`Tarjeta aceptada: ID ${id}`);
+}
+
+function mostrarNada() {
+  document.getElementById("txtNombre").textContent = "Ninguna tarjeta";
+  document.getElementById("txtDetalle").textContent = "Muestra una tarjeta a la cámara";
+  pintarBarra(0);
+  ponerEstado("Sin tarjeta → nivel 0");
+}
+
+// Barra de verde (nivel 0, tono 120) a rojo (nivel 10, tono 0)
+function pintarBarra(nivel) {
+  const barra = document.getElementById("barra");
+  barra.style.width = (nivel * 10) + "%";
+  barra.style.background = `hsl(${120 - nivel * 12}, 80%, 45%)`;
+}
+
+function ponerEstado(texto) {
+  document.getElementById("txtEstado").textContent = texto;
+}
+
+// Agrega una línea al registro de abajo (las más nuevas arriba, máximo 50)
+function registrar(texto, esAviso = false) {
+  const reg = document.getElementById("registro");
+  const linea = document.createElement("div");
+  if (esAviso) linea.className = "aviso";
+  linea.textContent = new Date().toLocaleTimeString("es-CL") + "  " + texto;
+  reg.prepend(linea);
+  while (reg.children.length > 50) reg.lastChild.remove();
+}
+
+// =====================================================================
+// 5. ENVIAR EL NIVEL ("N:x\n")
+// =====================================================================
+
+function enviarNivel(nivel) {
+  if (nivel === nivelEnviado) return;  // solo se envía cuando cambia
+  nivelEnviado = nivel;
+  const mensaje = `N:${nivel}\n`;
+
+  if (chkSinArduino.checked) {
+    registrar(`(sin Arduino) habría enviado: N:${nivel}`);
+  } else if (caracteristicaBLE) {
+    escribirBLE(mensaje);
+  } else {
+    registrar(`N:${nivel} no se envió: Arduino no conectado`, true);
+  }
+}
+
+// Escribe texto en la característica BLE, un mensaje a la vez
+function escribirBLE(texto) {
+  const datos = new TextEncoder().encode(texto);
+  const car = caracteristicaBLE;
+  colaEscritura = colaEscritura
+    .then(async () => {
+      if (car.properties.writeWithoutResponse && car.writeValueWithoutResponse) {
+        await car.writeValueWithoutResponse(datos);
+      } else {
+        await car.writeValue(datos);
+      }
+      registrar("Enviado: " + texto.trim());
+    })
+    .catch(error => registrar("Error al enviar: " + error.message, true));
+}
+
+// =====================================================================
+// 6. BLUETOOTH (Web Bluetooth)
+// =====================================================================
+
+async function conectarArduino() {
+  try {
+    const opciones = MOSTRAR_TODOS_LOS_DISPOSITIVOS
+      ? { acceptAllDevices: true, optionalServices: [SERVICE_UUID] }
+      : { filters: [{ services: [SERVICE_UUID] }] };
+
+    dispositivoBLE = await navigator.bluetooth.requestDevice(opciones);  // abre la lista de dispositivos
+    dispositivoBLE.addEventListener("gattserverdisconnected", alDesconectar);
+
+    btnConectar.textContent = "Conectando…";
+    const servidor = await dispositivoBLE.gatt.connect();
+    const servicio = await servidor.getPrimaryService(SERVICE_UUID);
+    caracteristicaBLE = await servicio.getCharacteristic(RX_CHAR_UUID);
+
+    btnConectar.textContent = "✅ Conectado: " + (dispositivoBLE.name || "Arduino");
+    btnConectar.classList.add("conectado");
+    registrar("Conectado a " + (dispositivoBLE.name || "Arduino"));
+
+    // Al conectar, enviamos el nivel actual para que el Arduino quede sincronizado
+    if (!chkSinArduino.checked) escribirBLE(`N:${nivelEnviado ?? 0}\n`);
+  } catch (error) {
+    // Si el usuario cierra la lista sin elegir, también llega aquí (NotFoundError)
+    registrar("No se pudo conectar: " + error.message, true);
+    btnConectar.textContent = "Conectar Arduino";
+    caracteristicaBLE = null;
+  }
+}
+
+function alDesconectar() {
+  caracteristicaBLE = null;
+  btnConectar.textContent = "Conectar Arduino";
+  btnConectar.classList.remove("conectado");
+  registrar("Arduino desconectado", true);
+}
+
+btnConectar.addEventListener("click", () => {
+  if (dispositivoBLE && dispositivoBLE.gatt.connected) {
+    dispositivoBLE.gatt.disconnect();  // si ya está conectado, el botón desconecta
+  } else {
+    conectarArduino();
+  }
+});
+
+chkSinArduino.addEventListener("change", () => {
+  registrar(chkSinArduino.checked ? "Modo sin Arduino ACTIVADO" : "Modo sin Arduino desactivado");
+  // Al volver al modo normal con el Arduino conectado, le enviamos el nivel actual
+  if (!chkSinArduino.checked && caracteristicaBLE) escribirBLE(`N:${nivelEnviado ?? 0}\n`);
+});
+
+// =====================================================================
+// 7. INICIO
+// =====================================================================
+
+async function iniciar() {
+  // Web Bluetooth no existe en iPhone/Safari/Firefox: se desactiva el botón y se usa el modo sin Arduino
+  if (!navigator.bluetooth) {
+    btnConectar.disabled = true;
+    btnConectar.textContent = "Bluetooth no disponible aquí";
+    chkSinArduino.checked = true;
+    registrar("Web Bluetooth no disponible (iPhone/Safari/Firefox). Usen Chrome en Android. Modo sin Arduino activado.", true);
+  }
+
+  try {
+    await cargarTabla();
+  } catch (error) {
+    ponerEstado("❌ Tabla no cargada: revisen que ajies.json esté junto a index.html y sea válido.");
+    registrar("Error al leer ajies.json: " + error.message, true);
+    return;
+  }
+
+  try {
+    await iniciarCamara();
+  } catch (error) {
+    ponerEstado("❌ No se pudo abrir la cámara: " + error.message);
+    registrar("Cámara: den permiso de cámara y abran la página por HTTPS o localhost. (" + error.name + ")", true);
+    return;
+  }
+
+  // Mantener la pantalla encendida mientras se usa (si el navegador lo permite)
+  try { await navigator.wakeLock.request("screen"); } catch (e) { /* no es importante */ }
+
+  ponerEstado("Listo. Muestra una tarjeta a la cámara.");
+  ultimaDeteccion = performance.now();
+  requestAnimationFrame(procesarCuadro);
+}
+
+iniciar();
+</script>
+</body>
+</html>

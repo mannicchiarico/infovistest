@@ -1,6 +1,6 @@
 # Estado del código de reconocimiento
 
-Última actualización: 15 de noviembre de 2026.
+Última actualización: 17 de noviembre de 2026.
 
 ## Resumen
 El sistema funciona así: el teléfono Android abre la página en Chrome, la cámara reconoce la tarjeta ArUco, se
@@ -41,8 +41,8 @@ poco, probar con 2).
 ## Qué está verificado
 - El JavaScript de `index.html` no tiene errores de sintaxis (`node --check`).
 - El formato de `ajies.json` es válido.
-- La fórmula da estos niveles para los IDs 0–19 de la tabla de ejemplo:
-  `0,3,4,4,5,5,5,6,6,7,7,7,7,7,7,8,8,9,10,10`.
+- La fórmula da estos niveles para los IDs 0–24 de la tabla de ejemplo (los 25 ajíes de R2):
+  `0,3,4,4,5,5,5,5,6,6,6,7,7,7,7,7,7,7,8,8,8,9,9,10,10`.
 - js-aruco2 trae el diccionario 4x4 de OpenCV, y los IDs 0–49 coinciden con DICT_4X4_50 (revisado en el código
   fuente).
 - La conexión WebUSB sigue los pasos del demo oficial de la librería WebUSB para Arduino, que también usa Protobject.
@@ -58,7 +58,7 @@ poco, probar con 2).
 2. **Preparar el IDE de Arduino**, si no quedó hecho en R2: instalar la librería WebUSB y cambiar `USB_VERSION` de
    `0x200` a `0x210` en `USBCore.h`. Los pasos están en el comentario del sketch.
 3. **Subir `receptor_webusb.ino`** a la placa. Reemplaza el firmware de Protobject.
-4. **Reemplazar la tabla de ejemplo** de `ajies.json` por los ajíes reales y sus IDs (0–19), y ajustar `shu_max`.
+4. **Reemplazar la tabla de ejemplo** de `ajies.json` por los ajíes reales y sus IDs (0–49), y ajustar `shu_max`.
 5. **Generar e imprimir las tarjetas** en chev.me (diccionario 4x4, papel mate, de al menos 4–5 cm, con margen blanco).
 6. **Volver a subir `index.html` y `ajies.json`** a GitHub Pages: la versión publicada todavía puede tener el botón
    de Bluetooth.

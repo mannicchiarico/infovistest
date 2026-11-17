@@ -26,13 +26,13 @@ pyserial). **El usuario pidió eliminarlas**: no las reintroduzcas salvo que lo 
   nivel; tras 1,5 s sin marcador (`MS_SIN_TARJETA`) se envía `N:0`. Al conectar, se reenvía el nivel actual.
 
 ## Decisiones técnicas verificadas
-- **Marcadores**: ArUco DICT_4X4_50, IDs 0–19, generados en https://chev.me/arucogen/ con el diccionario "4x4".
+- **Marcadores**: ArUco DICT_4X4_50, IDs 0–24 (25 ajíes de ejemplo; el diccionario admite hasta el 49), generados en https://chev.me/arucogen/ con el diccionario "4x4".
   En papel mate, de al menos 4–5 cm y con margen blanco.
 - **Librería JS**: js-aruco2 2.0.0 desde jsDelivr (`cv.js`, `aruco.js`, `dictionaries/aruco_4x4_1000.js`, en ese orden).
   Su `ARUCO_4X4_1000` fue extraído de `predefined_dictionaries.hpp` de OpenCV. OpenCV usa la misma lista de bytes para
   4x4_50/100/250/1000, así que los IDs 0–49 coinciden. js-aruco2 acepta un código si `distancia < tau`;
   `maxHammingDistance: 1` = solo coincidencias exactas. Además se ignoran los IDs que no están en la tabla.
-- **Placa**: inferida desde R2 (`../R2/app.js`, que usa Protobject). Protobject se conecta por WebUSB y filtra los
+- **Placa**: inferida desde R2 (`../iic2026-grupo-7-E2/docs/R2/app.js`, que usa Protobject). Protobject se conecta por WebUSB y filtra los
   vendorId 0x2341 (productos 0x8036 Leonardo, 0x8037 Micro, MKR/Zero) y 0x239A (Adafruit). El Uno no está en la
   lista. Conclusión: Leonardo o Micro (ATmega32U4). **El usuario aún no lo ha confirmado mirando la placa.**
 - **WebUSB**: el código replica el demo oficial de https://github.com/webusb/arduino (`demos/serial.js`): buscar la

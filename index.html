@@ -1,22 +1,24 @@
 <!DOCTYPE html>
 <!--
-  VERSIÓN A: página web + Bluetooth (BLE). Pensada para Chrome en Android.
+  DETECTOR DE AJÍES (Chrome en Android). Reconoce la tarjeta ArUco con la cámara del teléfono y envía "N:x\n"
+  (x = nivel 0-10) a un Arduino Leonardo o Micro conectado al teléfono por cable, con un adaptador OTG (como en R2).
+  Sketch del Arduino: arduino/receptor_webusb (lleva la librería WebUSB; las instrucciones están en ese archivo).
 
   CÓMO USARLA
   - Pongan este index.html y ajies.json en la MISMA carpeta (la tabla de ajíes se edita en ajies.json).
   - La cámara solo funciona con HTTPS o en localhost. Con doble clic (file://) NO funciona.
       · En el computador: en esta carpeta corran  python -m http.server 8000  y abran http://localhost:8000
       · En el teléfono: súbanla a un hosting con HTTPS (GitHub Pages, Netlify, etc.) y ábranla en Chrome.
-  - "Conectar Arduino" busca una placa que anuncie el servicio BLE de SERVICE_UUID (abajo, en la configuración).
   - Marquen "Modo sin Arduino" para probar solo la detección: se ve en pantalla lo que se habría enviado.
 
   ERRORES COMUNES
   - "No se pudo abrir la cámara": den permiso de cámara (candado junto a la dirección > Permisos) y
     revisen que la página esté en https:// o localhost.
-  - El botón de Bluetooth está desactivado: Web Bluetooth no existe en iPhone/iPad (ningún navegador),
-    Safari ni Firefox. Usen Chrome en Android (o Chrome/Edge en el computador). También hay que activar Bluetooth
-    y, en Android, la ubicación.
-  - "No aparece el Arduino en la lista": revisen que el sketch esté corriendo y que los UUID coincidan.
+  - Botón desactivado: WebUSB no existe en iPhone/iPad (ningún navegador), Safari ni Firefox.
+    Usen Chrome en Android (o Chrome/Edge en el computador).
+  - No aparece la placa en la lista: revisen el adaptador OTG y que el cable transmita datos (no solo carga).
+  - "La placa no tiene la interfaz WebUSB": no se cargó receptor_webusb, o es un Uno (el Uno no sirve).
+  - Si sigue cargado el firmware de Protobject de R2, se conecta pero el Arduino ignora los mensajes: suban receptor_webusb.
   - "Tabla no cargada": ajies.json no está junto a index.html o tiene un error de formato (falta una coma, etc.).
 -->
 <html lang="es">
@@ -103,7 +105,7 @@
   </section>
 
   <div class="controles">
-    <button id="btnConectar" type="button">Conectar Arduino</button>
+    <button id="btnUSB" type="button">Conectar Arduino (cable USB)</button>
     <label><input type="checkbox" id="chkSinArduino" /> Modo sin Arduino</label>
   </div>
 
@@ -115,14 +117,14 @@
 // CONFIGURACIÓN (cambien aquí si hace falta)
 // =====================================================================
 
-// UUID del servicio BLE y de la característica donde se ESCRIBE el mensaje.
-// Por defecto: Nordic UART Service (NUS), igual que en los sketches de referencia.
-// (Si usaran un módulo HM-10: SERVICE_UUID = 0xffe0 y RX_CHAR_UUID = 0xffe1, como números.)
-const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-const RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
-
-// Si el Arduino no aparece en la lista, pongan true para mostrar TODOS los dispositivos Bluetooth.
-const MOSTRAR_TODOS_LOS_DISPOSITIVOS = false;
+// Placas que aparecen en la lista al conectar por cable USB (WebUSB).
+// vendorId = fabricante. Leonardo = producto 0x8036, Micro = 0x8037 (son las placas que acepta Protobject en R2).
+const FILTROS_USB = [
+  { vendorId: 0x2341 },   // Arduino (Leonardo, Micro, MKR, Zero...)
+  { vendorId: 0x2a03 },   // Arduino (placas antiguas de arduino.org)
+  { vendorId: 0x239a },   // Adafruit
+  { vendorId: 0x1b4f }    // SparkFun (Pro Micro)
+];
 
 const CUADROS_PARA_ACEPTAR = 4;   // cuadros seguidos con el mismo ID antes de aceptarlo (3-5)
 const MS_SIN_TARJETA = 1500;      // milisegundos sin marcador antes de enviar "N:0"
@@ -142,16 +144,19 @@ let idAceptado = null;        // ID ya confirmado (el que se muestra)
 let ultimaDeteccion = performance.now();
 let nivelEnviado = null;      // último nivel enviado (para enviar solo cuando cambia)
 
-// Estado del Bluetooth
-let dispositivoBLE = null;
-let caracteristicaBLE = null;
+// Estado del cable USB
+let dispositivoUSB = null;    // la placa conectada por cable (null = no conectada)
+let numeroInterfaz = 0;       // "canal" WebUSB de la placa
+let endpointSalida = 0;       // por donde se envían los datos a la placa
+let endpointEntrada = 0;      // por donde llegan las respuestas de la placa
+
 let colaEscritura = Promise.resolve();  // para no escribir dos mensajes al mismo tiempo
 
 // Elementos de la página
 const video = document.getElementById("video");
 const lienzo = document.getElementById("lienzo");
 const ctx = lienzo.getContext("2d", { willReadFrequently: true });
-const btnConectar = document.getElementById("btnConectar");
+const btnUSB = document.getElementById("btnUSB");
 const chkSinArduino = document.getElementById("chkSinArduino");
 
 // Detector ArUco (maxHammingDistance: 1 = solo acepta coincidencias exactas, menos falsos positivos)
@@ -338,80 +343,131 @@ function enviarNivel(nivel) {
 
   if (chkSinArduino.checked) {
     registrar(`(sin Arduino) habría enviado: N:${nivel}`);
-  } else if (caracteristicaBLE) {
-    escribirBLE(mensaje);
+  } else if (dispositivoUSB) {
+    escribirArduino(mensaje);
   } else {
     registrar(`N:${nivel} no se envió: Arduino no conectado`, true);
   }
 }
 
-// Escribe texto en la característica BLE, un mensaje a la vez
-function escribirBLE(texto) {
+// Escribe el texto en el Arduino por el cable USB, un mensaje a la vez
+function escribirArduino(texto) {
   const datos = new TextEncoder().encode(texto);
-  const car = caracteristicaBLE;
   colaEscritura = colaEscritura
     .then(async () => {
-      if (car.properties.writeWithoutResponse && car.writeValueWithoutResponse) {
-        await car.writeValueWithoutResponse(datos);
-      } else {
-        await car.writeValue(datos);
-      }
+      if (!dispositivoUSB) return;   // se desconectó mientras esperaba
+      await dispositivoUSB.transferOut(endpointSalida, datos);
       registrar("Enviado: " + texto.trim());
     })
     .catch(error => registrar("Error al enviar: " + error.message, true));
 }
 
 // =====================================================================
-// 6. BLUETOOTH (Web Bluetooth)
+// 6. CONEXIÓN POR CABLE USB (WebUSB)
+//    Igual que el demo oficial de la librería WebUSB para Arduino (webusb.github.io/arduino)
 // =====================================================================
 
-async function conectarArduino() {
+async function conectarUSB() {
   try {
-    const opciones = MOSTRAR_TODOS_LOS_DISPOSITIVOS
-      ? { acceptAllDevices: true, optionalServices: [SERVICE_UUID] }
-      : { filters: [{ services: [SERVICE_UUID] }] };
+    dispositivoUSB = await navigator.usb.requestDevice({ filters: FILTROS_USB });  // abre la lista de placas
+    btnUSB.textContent = "Conectando…";
+    await dispositivoUSB.open();
+    if (dispositivoUSB.configuration === null) {
+      await dispositivoUSB.selectConfiguration(1);
+    }
 
-    dispositivoBLE = await navigator.bluetooth.requestDevice(opciones);  // abre la lista de dispositivos
-    dispositivoBLE.addEventListener("gattserverdisconnected", alDesconectar);
+    // Buscar la interfaz WebUSB de la placa (es la de clase 0xFF, "del fabricante")
+    let interfaz = null;
+    for (const i of dispositivoUSB.configuration.interfaces) {
+      if (i.alternates[0].interfaceClass === 0xff) interfaz = i;
+    }
+    if (!interfaz) {
+      throw new Error("La placa no tiene la interfaz WebUSB. ¿Cargaron receptor_webusb? (El Uno no sirve por cable.)");
+    }
+    numeroInterfaz = interfaz.interfaceNumber;
+    for (const e of interfaz.alternates[0].endpoints) {
+      if (e.direction === "out") endpointSalida = e.endpointNumber;
+      if (e.direction === "in") endpointEntrada = e.endpointNumber;
+    }
 
-    btnConectar.textContent = "Conectando…";
-    const servidor = await dispositivoBLE.gatt.connect();
-    const servicio = await servidor.getPrimaryService(SERVICE_UUID);
-    caracteristicaBLE = await servicio.getCharacteristic(RX_CHAR_UUID);
+    await dispositivoUSB.claimInterface(numeroInterfaz);
+    await dispositivoUSB.selectAlternateInterface(numeroInterfaz, 0);
+    // "Abrir el puerto": le avisa a la placa que hay alguien conectado (como abrir el Monitor Serial)
+    await dispositivoUSB.controlTransferOut({
+      requestType: "class", recipient: "interface", request: 0x22, value: 0x01, index: numeroInterfaz
+    });
 
-    btnConectar.textContent = "✅ Conectado: " + (dispositivoBLE.name || "Arduino");
-    btnConectar.classList.add("conectado");
-    registrar("Conectado a " + (dispositivoBLE.name || "Arduino"));
+    btnUSB.textContent = "✅ Cable: " + (dispositivoUSB.productName || "Arduino");
+    btnUSB.classList.add("conectado");
+    registrar("Conectado por cable a " + (dispositivoUSB.productName || "Arduino"));
+    leerUSB();
 
     // Al conectar, enviamos el nivel actual para que el Arduino quede sincronizado
-    if (!chkSinArduino.checked) escribirBLE(`N:${nivelEnviado ?? 0}\n`);
+    if (!chkSinArduino.checked) escribirArduino(`N:${nivelEnviado ?? 0}\n`);
   } catch (error) {
     // Si el usuario cierra la lista sin elegir, también llega aquí (NotFoundError)
-    registrar("No se pudo conectar: " + error.message, true);
-    btnConectar.textContent = "Conectar Arduino";
-    caracteristicaBLE = null;
+    registrar("No se pudo conectar por cable: " + error.message, true);
+    if (dispositivoUSB && dispositivoUSB.opened) dispositivoUSB.close().catch(() => {});
+    dispositivoUSB = null;
+    btnUSB.textContent = "Conectar Arduino (cable USB)";
   }
 }
 
-function alDesconectar() {
-  caracteristicaBLE = null;
-  btnConectar.textContent = "Conectar Arduino";
-  btnConectar.classList.remove("conectado");
-  registrar("Arduino desconectado", true);
+// Lee lo que responde la placa ("Nivel recibido: x") y lo muestra en el registro
+async function leerUSB() {
+  const decodificador = new TextDecoder();
+  let pendiente = "";
+  while (dispositivoUSB && dispositivoUSB.opened) {
+    try {
+      const resultado = await dispositivoUSB.transferIn(endpointEntrada, 64);
+      pendiente += decodificador.decode(resultado.data);
+      const lineas = pendiente.split("\n");
+      pendiente = lineas.pop();   // lo que queda sin "\n" espera al próximo trozo
+      for (const linea of lineas) {
+        if (linea.trim()) registrar("Arduino dice: " + linea.trim());
+      }
+    } catch (error) {
+      break;   // la placa se desconectó
+    }
+  }
 }
 
-btnConectar.addEventListener("click", () => {
-  if (dispositivoBLE && dispositivoBLE.gatt.connected) {
-    dispositivoBLE.gatt.disconnect();  // si ya está conectado, el botón desconecta
+async function desconectarUSB() {
+  try {
+    await dispositivoUSB.controlTransferOut({
+      requestType: "class", recipient: "interface", request: 0x22, value: 0x00, index: numeroInterfaz
+    });
+    await dispositivoUSB.close();
+  } catch (error) { /* ya estaba desconectada */ }
+  alDesconectarUSB();
+}
+
+function alDesconectarUSB() {
+  dispositivoUSB = null;
+  btnUSB.textContent = "Conectar Arduino (cable USB)";
+  btnUSB.classList.remove("conectado");
+  registrar("Arduino (cable) desconectado", true);
+}
+
+btnUSB.addEventListener("click", () => {
+  if (dispositivoUSB) {
+    desconectarUSB();   // si ya está conectado, el botón desconecta
   } else {
-    conectarArduino();
+    conectarUSB();
   }
 });
+
+// Si se desenchufa el cable
+if (navigator.usb) {
+  navigator.usb.addEventListener("disconnect", evento => {
+    if (evento.device === dispositivoUSB) alDesconectarUSB();
+  });
+}
 
 chkSinArduino.addEventListener("change", () => {
   registrar(chkSinArduino.checked ? "Modo sin Arduino ACTIVADO" : "Modo sin Arduino desactivado");
   // Al volver al modo normal con el Arduino conectado, le enviamos el nivel actual
-  if (!chkSinArduino.checked && caracteristicaBLE) escribirBLE(`N:${nivelEnviado ?? 0}\n`);
+  if (!chkSinArduino.checked && dispositivoUSB) escribirArduino(`N:${nivelEnviado ?? 0}\n`);
 });
 
 // =====================================================================
@@ -419,12 +475,12 @@ chkSinArduino.addEventListener("change", () => {
 // =====================================================================
 
 async function iniciar() {
-  // Web Bluetooth no existe en iPhone/Safari/Firefox: se desactiva el botón y se usa el modo sin Arduino
-  if (!navigator.bluetooth) {
-    btnConectar.disabled = true;
-    btnConectar.textContent = "Bluetooth no disponible aquí";
+  // WebUSB no existe en iPhone/Safari/Firefox: se desactiva el botón y se usa el modo sin Arduino
+  if (!navigator.usb) {
+    btnUSB.disabled = true;
+    btnUSB.textContent = "Cable USB no disponible aquí";
     chkSinArduino.checked = true;
-    registrar("Web Bluetooth no disponible (iPhone/Safari/Firefox). Usen Chrome en Android. Modo sin Arduino activado.", true);
+    registrar("Este navegador no puede conectarse al Arduino (iPhone/Safari/Firefox). Usen Chrome en Android. Modo sin Arduino activado.", true);
   }
 
   try {
